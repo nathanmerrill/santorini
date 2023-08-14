@@ -6,8 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bitvec = "1.0.1"
+colored = "2.0.4"
 lazy_static = "1.4.0"
-minimax = "0.5.1"
+minimax = "0.5.2"
 rand = "0.8.5"
 
+[profile.release]
+debug = true
