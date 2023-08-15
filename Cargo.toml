@@ -10,6 +10,9 @@ colored = "2.0.4"
 lazy_static = "1.4.0"
 minimax = "0.5.2"
 rand = "0.8.5"
+random-integer = "1.2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [profile.release]
 debug = true
