@@ -4,118 +4,54 @@ use serde::{Deserialize, Serialize};
 use minimax::{Strategy, Game, ParallelSearch};
 
 use colored::Colorize;
-use rand::{rngs::ThreadRng, RngCore, Rng, seq::IteratorRandom};
+use rand::{rngs::ThreadRng, RngCore, Rng};
 
 
-fn main() {
-    let mut population = Population::read();
+fn main() 
+{
+    let mut eval = Eval::read();
     loop {
-        println!("Iteration {}", population.iteration);
-        population.diff_evolution();
-        population.iteration += 1;
-        population.save();
-        
-        //println!("Testing latest specimen");
-
-        //run_full_game(population.population[0].clone());
+        println!("Iteration {}", eval.iteration);
+        train(&mut eval);
+        eval.iteration += 1;
+        eval.save();
     }
 }
 
-
-#[derive(Serialize, Deserialize)]
-struct Population {
-    iteration: usize,
-    population: Vec<Eval>
-}
-
-const EVO_RATE: f64 = 0.5;
-const CROSSOVER_RATE: f64 = 0.9;
-const POP_SIZE: usize = 1000;
-const FACTOR_COUNT: usize = 74;
+const FACTOR_COUNT: usize = 46;
+const HIDDEN_LAYER_COUNT: usize = 20;
+const LEARNING_RATE: f64 = 0.5;
 const FILE_PATH: &str = "./src/weights.json";
 
-impl Population {
-    fn read() -> Self {
-        if std::fs::metadata(FILE_PATH).is_ok() {
-            Self::from_file()
-        } else {
-            Self::new_random()
-        }
-    }
-
-    fn new_random() -> Self {
-        Self {
-            iteration: 0,
-            population: (0..POP_SIZE).map(|_| Eval::random()).collect()
-        }
-    }
-
-    fn save(&self) 
-    {
-        let value = serde_json::to_string_pretty(self).expect("Unable to serialize!");
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(FILE_PATH).expect("Unable to open file!");
-        file.write(value.as_bytes()).expect("Unable to write file!");
-    }
-
-    fn from_file() -> Self {
-        let data = std::fs::read_to_string(FILE_PATH).expect("Unable to read file!");
-        serde_json::from_str(&data).expect("Unable to parse file!")
-    }
-
-    fn diff_evolution(&mut self) 
-    {
-        let mut rng = rand::thread_rng();
-        let mut next_population = vec![];
-        for i in 0..self.population.len() {
-            let choices = self.population.iter().choose_multiple(&mut rng, 3);
-            
-            let mutant = choices[2].mutate(choices[0], choices[1]);
-            let trial = self.population[i].cross_over(&mutant);
-
-            let peers = self.population.iter().choose_multiple(&mut rng, 10);
-
-            let mut trial_count: usize = 0;
-            let mut existing_count: usize = 0;
-            for peer in peers {
-                if compare_evals(peer.clone(), trial.clone()) {
-                    trial_count += 1;
-                }
-                if !compare_evals(trial.clone(), peer.clone()) {
-                    trial_count += 1;
-                }
-                if compare_evals(peer.clone(), self.population[i].clone()) {
-                    existing_count += 1;
-                }
-                if !compare_evals(self.population[i].clone(), peer.clone()) {
-                    existing_count += 1;
-                }
-
-            }
-            if trial_count > existing_count {
-                let diff: f64 = self.population[i].weights.iter().zip(&trial.weights).map(|(a, b)| (a - b).abs()).sum();
-                next_population.push(trial);
-
-                println!("Trial specimen won {} battles, baseline won {} battles. Replacing specimen {}. Weight Diff: {}", trial_count, existing_count, i, diff);
-            } else {
-                next_population.push(self.population[i].clone());
-                println!("Trial specimen won {} battles, baseline won {} battles. Keeping specimen {}", trial_count, existing_count, i);
-            }
-        }
-
-        self.population = next_population;
-    }
-}
-
-fn run_full_game(eval: Eval) 
+fn train(eval: &mut Eval)
 {
-    let mut strategy = ParallelSearch::new(eval, minimax::IterativeOptions::default().with_mtdf().verbose(), minimax::ParallelOptions::new());    
+    let mut strategy = ParallelSearch::new(eval.clone(), minimax::IterativeOptions::default().with_mtdf().verbose(), minimax::ParallelOptions::new());    
     strategy.set_max_depth(6);
     let mut game = GameState::default();
 
     while !game.game_over {
         println!("{}", game);
-        let _move = strategy.choose_move(&game).expect("No moves returned from strategy!");
-        game = Santorini::apply(&mut game, _move).expect("State was not applied!");
+        let best_move = strategy.choose_move(&game).expect("No moves returned from strategy!");
+        let factors = Eval::get_factors(&game);
+        let (evaluation, hidden_outputs) = eval.forward_propagate(&factors);
+        let mut future_state = game.clone();
+        for _move in strategy.principal_variation() {
+            future_state = Santorini::apply(&mut future_state, _move).expect("State was not applied!");
+        }
+
+        let future_eval = if future_state.game_over {
+            if future_state.winner == future_state.current_player {
+                1.0
+            } else {
+                -1.0
+            }
+        } else {
+            eval.forward_propagate(&Eval::get_factors(&future_state)).0
+        };
+
+        eval.back_propagate(future_eval, evaluation, &hidden_outputs, &factors);        
+
+        game = Santorini::apply(&mut game, best_move).expect("State was not applied!");
     }
     
     println!("{}", game);
@@ -127,64 +63,160 @@ fn run_full_game(eval: Eval)
     }
 }
 
-fn compare_evals(baseline_eval: Eval, trial_eval: Eval) -> bool // Returns true if new eval is better than the old one
-{
-    let mut baseline = ParallelSearch::new(baseline_eval, minimax::IterativeOptions::default(), minimax::ParallelOptions::new());
-    let mut new = ParallelSearch::new(trial_eval, minimax::IterativeOptions::default(), minimax::ParallelOptions::new());
-
-    baseline.set_max_depth(4);
-    new.set_max_depth(4);
-
-    let baseline_player = Player::P1;
-    
-    let mut game = GameState::default();
-    
-    while !game.game_over {
-
-        let eval = if game.current_player == baseline_player {
-            &mut baseline
-        } else {
-            &mut new
-        };
-        
-        let _move = eval.choose_move(&mut game).expect("No moves returned from strategy!");
-
-        game = Santorini::apply(&mut game, _move).expect("State was not applied!");
-    }
-
-    return game.winner != baseline_player
-}
-
 // To run the search we need an evaluator.
 #[derive(Clone, Serialize, Deserialize)]
 struct Eval {
-    weights: Vec<f64>
+    iteration: usize,
+    hidden_layer: Vec<f64>, // Collapsed 2d array.  Each (FACTOR_COUNT+1) elements is a separate node
+    output_node: Vec<f64>,
 }
 
 impl Eval {
-    fn random() -> Self {
-        let mut rng = rand::thread_rng();
-        Self {
-            weights: (0..FACTOR_COUNT).map(|_| rng.gen_range(-1.0..1.0)).collect()
+    
+    fn save(&self) 
+    {
+        let value = serde_json::to_string_pretty(self).expect("Unable to serialize!");
+        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(FILE_PATH).expect("Unable to open file!");
+        file.write(value.as_bytes()).expect("Unable to write file!");
+    }
+ 
+    fn from_file() -> Self {
+        let data = std::fs::read_to_string(FILE_PATH).expect("Unable to read file!");
+        serde_json::from_str(&data).expect("Unable to parse file!")
+    }
+
+    fn read() -> Self {
+        if std::fs::metadata(FILE_PATH).is_ok() {
+            Self::from_file()
+        } else {
+            Self::new()
         }
     }
 
-    fn mutate(&self, cand_a: &Self, cand_b: &Self) -> Self {
-        let weights: Vec<_> = (0..FACTOR_COUNT).map(|i| (self.weights[i] + EVO_RATE * (cand_b.weights[i] - cand_a.weights[i]))).collect();
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        Self {
+            iteration: 0,
+            hidden_layer: (0..(HIDDEN_LAYER_COUNT * (FACTOR_COUNT+1))).map(|_|rng.gen_range(0.0..1.0)).collect(),
+            output_node: (0..HIDDEN_LAYER_COUNT+1).map(|_|rng.gen_range(0.0..1.0)).collect()
+        }
+    }
 
-        let max: f64 = weights.iter().map(|a| a.abs()).fold(0.0, f64::max);
+    fn activate(input: &[f64], layer: &[f64]) -> f64 {
+        let mut iter = layer.iter();
+        let bias = iter.next().unwrap();
+        let sum: f64 = iter.zip(input).map(|(weight, input)| weight * input).sum();
+        1.0 / ((-bias - sum).exp() + 1.0)
+    }
+
+    fn forward_propagate(&self, input: &[f64]) -> (f64, Vec<f64>) 
+    {
+        let hidden: Vec<f64> = self.hidden_layer.chunks_exact(FACTOR_COUNT+1).map(|a| {
+            Self::activate(input, a)
+        }).collect();
+
+        let output = Self::activate(&hidden, &self.output_node);
+
+        (output, hidden)
+    }
+
+    fn back_propagate(&mut self, expected: f64, output: f64, hidden_outputs: &Vec<f64>, input: &Vec<f64>)
+    {
+        let output_error = (output - expected) * output * (1.0-output);
+        let hidden_errors = self.output_node.iter()
+            .skip(1)
+            .zip(hidden_outputs).map(|(weight, output)| {
+                weight * output_error * output * (1.0-output)
+            });
         
-        Self {
-            weights: weights.into_iter().map(|a| a/max).collect()
+        for (node, hidden_error) in self.hidden_layer.chunks_exact_mut(FACTOR_COUNT+1).zip(hidden_errors) {
+            Self::train_node(node, hidden_error, input);
+        }
+    
+        Self::train_node(&mut self.output_node, output_error, hidden_outputs);
+    }
+
+    fn train_node(node: &mut [f64], error: f64, inputs: &Vec<f64>) 
+    {
+        let mut node_iter = node.iter_mut();
+        *node_iter.next().unwrap() -= LEARNING_RATE * error; // Bias node
+
+        for (weight, input) in node_iter.zip(inputs) 
+        {
+            *weight -= LEARNING_RATE * error * input
         }
     }
 
-    fn cross_over(&self, mutant: &Self) -> Self {
-        let mut rng = rand::thread_rng();
-        let position = rng.gen_range(0..74);
-        Self {
-            weights: (0..FACTOR_COUNT).map(|i| if i == position || rng.gen_bool(CROSSOVER_RATE) {mutant.weights[i]} else {self.weights[i]}).collect()
-        }
+    fn get_factors(state: &GameState) -> Vec<f64> 
+    {
+        let my_workers = state.worker_positions(state.current_player);
+        let my_worker_heights = [state.squares[my_workers[0]].height as usize, state.squares[my_workers[1]].height as usize];
+        let opp_workers = state.worker_positions(state.current_player.opposite());
+        let opp_worker_heights = [state.squares[opp_workers[0]].height as usize, state.squares[opp_workers[1]].height as usize];
+        
+        let (my_high_worker, my_high_worker_height, my_low_worker, my_low_worker_height) = if my_worker_heights[0] < my_worker_heights[1] {(my_workers[1], my_worker_heights[1], my_workers[0], my_worker_heights[0])} else {(my_workers[0], my_worker_heights[0], my_workers[1], my_worker_heights[1])};
+        let (opp_high_worker, opp_high_worker_height, opp_low_worker, opp_low_worker_height) = if opp_worker_heights[0] < opp_worker_heights[1] {(opp_workers[1], opp_worker_heights[1], opp_workers[0], opp_worker_heights[0])} else {(opp_workers[0], opp_worker_heights[0], opp_workers[1], opp_worker_heights[1])};
+
+        let my_adjacent_high_heights = adjacent_heights(state, my_low_worker);
+        let my_adjacent_low_heights = adjacent_heights(state, my_high_worker);
+        let opp_adjacent_high_heights = adjacent_heights(state, opp_low_worker);
+        let opp_adjacent_low_heights = adjacent_heights(state, opp_high_worker);
+
+        let my_high_mobility = my_adjacent_high_heights[0] + my_adjacent_high_heights[1] + my_adjacent_high_heights[2] + my_adjacent_high_heights[3] + my_adjacent_high_heights[4];
+        let my_low_mobility = my_adjacent_low_heights[0] + my_adjacent_low_heights[1] + my_adjacent_low_heights[2] + my_adjacent_low_heights[3] + my_adjacent_low_heights[4];
+        let opp_high_mobility = opp_adjacent_high_heights[0] + opp_adjacent_high_heights[1] + opp_adjacent_high_heights[2] + opp_adjacent_high_heights[3] + opp_adjacent_high_heights[4];
+        let opp_low_mobility = opp_adjacent_low_heights[0] + opp_adjacent_low_heights[1] + opp_adjacent_low_heights[2] + opp_adjacent_low_heights[3] + opp_adjacent_low_heights[4];
+
+        let factors:[usize; FACTOR_COUNT] = [
+            distance_between(my_high_worker, my_low_worker),
+            distance_between(opp_high_worker, opp_low_worker),
+            distance_between(my_low_worker, opp_high_worker),
+            distance_between(my_low_worker, opp_low_worker),
+            distance_between(my_high_worker, opp_high_worker),
+            distance_between(my_high_worker, opp_low_worker),
+            my_high_worker_height,
+            my_low_worker_height,
+            opp_high_worker_height,
+            opp_low_worker_height,
+            my_adjacent_high_heights[0],
+            my_adjacent_high_heights[1],
+            my_adjacent_high_heights[2],
+            my_adjacent_high_heights[3],
+            my_adjacent_high_heights[4],
+            my_adjacent_high_heights[5],
+            my_adjacent_high_heights[6],
+            my_adjacent_high_heights[7],
+            my_adjacent_low_heights[0],
+            my_adjacent_low_heights[1],
+            my_adjacent_low_heights[2],
+            my_adjacent_low_heights[3],
+            my_adjacent_low_heights[4],
+            my_adjacent_low_heights[5],
+            my_adjacent_low_heights[6],
+            my_adjacent_low_heights[7],
+            opp_adjacent_high_heights[0],
+            opp_adjacent_high_heights[1],
+            opp_adjacent_high_heights[2],
+            opp_adjacent_high_heights[3],
+            opp_adjacent_high_heights[4],
+            opp_adjacent_high_heights[5],
+            opp_adjacent_high_heights[6],
+            opp_adjacent_high_heights[7],
+            opp_adjacent_low_heights[0],
+            opp_adjacent_low_heights[1],
+            opp_adjacent_low_heights[2],
+            opp_adjacent_low_heights[3],
+            opp_adjacent_low_heights[4],
+            opp_adjacent_low_heights[5],
+            opp_adjacent_low_heights[6],
+            opp_adjacent_low_heights[7],
+            my_high_mobility,
+            my_low_mobility,
+            opp_high_mobility,
+            opp_low_mobility,
+        ];
+
+        factors.into_iter().map(|f| f as f64).collect()
     }
 }
 
@@ -199,76 +231,7 @@ impl minimax::Evaluator for Eval {
                 minimax::WORST_EVAL
             }
         } else {
-            let my_workers = state.worker_positions(state.current_player);
-            let my_worker_heights = [state.squares[my_workers[0]].height as usize, state.squares[my_workers[1]].height as usize];
-            let opp_workers = state.worker_positions(state.current_player.opposite());
-            let opp_worker_heights = [state.squares[opp_workers[0]].height as usize, state.squares[opp_workers[1]].height as usize];
-            
-            let (my_high_worker, my_high_worker_height, my_low_worker, my_low_worker_height) = if my_worker_heights[0] < my_worker_heights[1] {(my_workers[1], my_worker_heights[1], my_workers[0], my_worker_heights[0])} else {(my_workers[0], my_worker_heights[0], my_workers[1], my_worker_heights[1])};
-            let (opp_high_worker, opp_high_worker_height, opp_low_worker, opp_low_worker_height) = if opp_worker_heights[0] < opp_worker_heights[1] {(opp_workers[1], opp_worker_heights[1], opp_workers[0], opp_worker_heights[0])} else {(opp_workers[0], opp_worker_heights[0], opp_workers[1], opp_worker_heights[1])};
-
-            let my_adjacent_high_heights = adjacent_heights(state, my_low_worker);
-            let my_adjacent_low_heights = adjacent_heights(state, my_high_worker);
-            let opp_adjacent_high_heights = adjacent_heights(state, opp_low_worker);
-            let opp_adjacent_low_heights = adjacent_heights(state, opp_high_worker);
-
-            let my_high_mobility = my_adjacent_high_heights[0] + my_adjacent_high_heights[1] + my_adjacent_high_heights[2] + my_adjacent_high_heights[3] + my_adjacent_high_heights[4];
-            let my_low_mobility = my_adjacent_low_heights[0] + my_adjacent_low_heights[1] + my_adjacent_low_heights[2] + my_adjacent_low_heights[3] + my_adjacent_low_heights[4];
-            let opp_high_mobility = opp_adjacent_high_heights[0] + opp_adjacent_high_heights[1] + opp_adjacent_high_heights[2] + opp_adjacent_high_heights[3] + opp_adjacent_high_heights[4];
-            let opp_low_mobility = opp_adjacent_low_heights[0] + opp_adjacent_low_heights[1] + opp_adjacent_low_heights[2] + opp_adjacent_low_heights[3] + opp_adjacent_low_heights[4];
-
-            let factors = [
-                distance_between(my_high_worker, my_low_worker),
-                distance_between(opp_high_worker, opp_low_worker),
-                distance_between(my_low_worker, opp_high_worker),
-                distance_between(my_low_worker, opp_low_worker),
-                distance_between(my_high_worker, opp_high_worker),
-                distance_between(my_high_worker, opp_low_worker),
-                my_high_worker_height,
-                my_low_worker_height,
-                opp_high_worker_height,
-                opp_low_worker_height,
-                my_adjacent_high_heights[0],
-                my_adjacent_high_heights[1],
-                my_adjacent_high_heights[2],
-                my_adjacent_high_heights[3],
-                my_adjacent_high_heights[4],
-                my_adjacent_high_heights[5],
-                my_adjacent_high_heights[6],
-                my_adjacent_high_heights[7],
-                my_adjacent_low_heights[0],
-                my_adjacent_low_heights[1],
-                my_adjacent_low_heights[2],
-                my_adjacent_low_heights[3],
-                my_adjacent_low_heights[4],
-                my_adjacent_low_heights[5],
-                my_adjacent_low_heights[6],
-                my_adjacent_low_heights[7],
-                opp_adjacent_high_heights[0],
-                opp_adjacent_high_heights[1],
-                opp_adjacent_high_heights[2],
-                opp_adjacent_high_heights[3],
-                opp_adjacent_high_heights[4],
-                opp_adjacent_high_heights[5],
-                opp_adjacent_high_heights[6],
-                opp_adjacent_high_heights[7],
-                opp_adjacent_low_heights[0],
-                opp_adjacent_low_heights[1],
-                opp_adjacent_low_heights[2],
-                opp_adjacent_low_heights[3],
-                opp_adjacent_low_heights[4],
-                opp_adjacent_low_heights[5],
-                opp_adjacent_low_heights[6],
-                opp_adjacent_low_heights[7],
-                my_high_mobility,
-                my_low_mobility,
-                opp_high_mobility,
-                opp_low_mobility,
-            ];
-
-            let sum: f64 = factors.into_iter().zip(&self.weights).map(|(factor, weight)| factor as f64 * weight).sum();
-            
-            return (sum*100.0).round() as i16
+            return (self.forward_propagate(&Self::get_factors(state)).0 * 1000.0).round() as i16;
         }
     }
 }
