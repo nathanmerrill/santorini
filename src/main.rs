@@ -7,51 +7,145 @@ use colored::Colorize;
 use rand::{rngs::ThreadRng, RngCore, Rng};
 
 
+const FACTOR_COUNT: usize = 42;
+const HIDDEN_LAYER_COUNT: usize = 2;
+const LEARNING_RATE: f64 = 1.0;
+const FILE_PATH: &str = "./src/weights.json";
+
 fn main() 
 {
-    let mut eval = Eval::read();
-    loop {
-        println!("Iteration {}", eval.iteration);
-        train(&mut eval);
-        eval.iteration += 1;
-        eval.save();
+    let args: Vec<_> = std::env::args().collect();
+    match args.get(1).map(|a| a.as_str()) {
+        Some("Compare") => compare_history(),
+        Some("Test") => test(),
+        Some(a) => panic!("Unexpected argument! {}", a),
+        None => create_history()
     }
 }
 
-const FACTOR_COUNT: usize = 46;
-const HIDDEN_LAYER_COUNT: usize = 20;
-const LEARNING_RATE: f64 = 0.5;
-const FILE_PATH: &str = "./src/weights.json";
+fn test() {
+    let inputs = [[2.7810836,2.550537003],
+    [1.465489372,2.362125076],
+    [3.396561688,4.400293529],
+    [1.38807019,1.850220317],
+    [3.06407232,3.005305973],
+    [7.627531214,2.759262235],
+    [5.332441248,2.088626775],
+    [6.922596716,1.77106367],
+    [8.675418651,-0.242068655],
+    [7.673756466,3.508563011]];
+    let outputs = [0.0,0.0,0.0,0.0,0.0,1.0,1.0,1.0,1.0,1.0];
 
-fn train(eval: &mut Eval)
+    let mut eval = Eval::new(2);
+
+    for i in 0..20 {
+        let mut error_sum = 0.0;
+        for (input, expected) in inputs.iter().zip(outputs) {
+            let (output, hidden_outputs) = eval.forward_propagate(input);
+            error_sum += eval.back_propagate(expected, output, &hidden_outputs, input, LEARNING_RATE);
+            
+        }
+        println!("Epoch: {} Error: {}", i, error_sum)
+    }
+    
+}
+
+fn create_history() {
+
+    let mut history = History::read();
+    history.save();
+    loop {
+        println!("Iteration {}", history.latest.iteration);
+        train(&mut history.latest);
+        history.latest.iteration += 1;
+        
+        if history.latest.iteration.is_power_of_two() {
+            history.evals.push(history.latest.clone());
+        }
+
+        history.save();
+    }
+}
+
+fn compare_history() {
+    
+    let history = History::read();
+    for eval in history.evals
+    {
+        if compare(eval.clone(), history.latest.clone()) {
+            println!("Iteration {} lost to final iteration {}", eval.iteration, history.latest.iteration);
+        } else {
+            println!("Iteration {} beat final iteration {}", eval.iteration, history.latest.iteration);
+        }
+    }
+}
+
+fn compare(baseline: Eval, target: Eval) -> bool
 {
-    let mut strategy = ParallelSearch::new(eval.clone(), minimax::IterativeOptions::default().with_mtdf().verbose(), minimax::ParallelOptions::new());    
-    strategy.set_max_depth(6);
+    let mut baseline = ParallelSearch::new(baseline, minimax::IterativeOptions::default(), minimax::ParallelOptions::new());
+    baseline.set_max_depth(6);
+    let mut target = ParallelSearch::new(target, minimax::IterativeOptions::default(), minimax::ParallelOptions::new());
+    target.set_max_depth(6);
+
     let mut game = GameState::default();
 
     while !game.game_over {
-        println!("{}", game);
+        let engine = if game.current_player == Player::P1 {
+            &mut baseline
+        } else {
+            &mut target
+        };
+        let best_move = engine.choose_move(&game).expect("No moves returned!");
+        game = Santorini::apply(&mut game, best_move).expect("State was not applied!");   
+    }
+
+    game.winner != Player::P1
+}
+
+fn train(eval: &mut Eval)
+{
+    let mut strategy = ParallelSearch::new(eval.clone(), minimax::IterativeOptions::default(), minimax::ParallelOptions::new());    
+    strategy.set_max_depth(4);
+    let mut game = GameState::default();
+
+    let mut history = vec![];
+
+    while !game.game_over {
         let best_move = strategy.choose_move(&game).expect("No moves returned from strategy!");
         let factors = Eval::get_factors(&game);
-        let (evaluation, hidden_outputs) = eval.forward_propagate(&factors);
+        let evaluation = eval.forward_propagate(&factors).0;
         let mut future_state = game.clone();
         for _move in strategy.principal_variation() {
             future_state = Santorini::apply(&mut future_state, _move).expect("State was not applied!");
         }
 
         let future_eval = if future_state.game_over {
-            if future_state.winner == future_state.current_player {
+            if future_state.winner == game.current_player {
                 1.0
             } else {
-                -1.0
+                0.0
             }
         } else {
             eval.forward_propagate(&Eval::get_factors(&future_state)).0
         };
 
-        eval.back_propagate(future_eval, evaluation, &hidden_outputs, &factors);        
+        history.push((game.clone(), future_eval));
+
+        println!("{}", game);
+        println!("Factors: {:?}", factors);
+        println!("Future eval: {}, Current eval: {}, Error: {}", future_eval, evaluation, (future_eval - evaluation).abs());
 
         game = Santorini::apply(&mut game, best_move).expect("State was not applied!");
+    }
+
+
+    for (i,(state, future_eval)) in history.into_iter().rev().enumerate()
+    {
+        let input = Eval::get_factors(&state);
+        let (evaluation, hidden_layers) = eval.forward_propagate(&input);
+        let rate = LEARNING_RATE*10.0 / (i+10) as f64;
+        let error = eval.back_propagate(future_eval, evaluation, &hidden_layers, &input, rate);
+        println!("Training at rate {:.3}.  Future eval: {:.3} Current eval: {:.3} Reported error: {}", rate, future_eval, evaluation, error);
     }
     
     println!("{}", game);
@@ -63,16 +157,13 @@ fn train(eval: &mut Eval)
     }
 }
 
-// To run the search we need an evaluator.
 #[derive(Clone, Serialize, Deserialize)]
-struct Eval {
-    iteration: usize,
-    hidden_layer: Vec<f64>, // Collapsed 2d array.  Each (FACTOR_COUNT+1) elements is a separate node
-    output_node: Vec<f64>,
+struct History {
+    latest: Eval,
+    evals: Vec<Eval>
 }
 
-impl Eval {
-    
+impl History {
     fn save(&self) 
     {
         let value = serde_json::to_string_pretty(self).expect("Unable to serialize!");
@@ -92,12 +183,31 @@ impl Eval {
             Self::new()
         }
     }
-
     fn new() -> Self {
+        let eval = Eval::new(FACTOR_COUNT);
+        Self {
+            latest: eval.clone(),
+            evals: vec![eval]
+        }
+    }
+}
+
+// To run the search we need an evaluator.
+#[derive(Clone, Serialize, Deserialize)]
+struct Eval {
+    iteration: usize,
+    factor_count: usize,
+    hidden_layer: Vec<f64>, // Collapsed 2d array.  Each (FACTOR_COUNT+1) elements is a separate node
+    output_node: Vec<f64>,
+}
+
+impl Eval {
+    fn new(factor_count: usize) -> Self {
         let mut rng = rand::thread_rng();
         Self {
             iteration: 0,
-            hidden_layer: (0..(HIDDEN_LAYER_COUNT * (FACTOR_COUNT+1))).map(|_|rng.gen_range(0.0..1.0)).collect(),
+            factor_count,
+            hidden_layer: (0..(HIDDEN_LAYER_COUNT * (factor_count+1))).map(|_|rng.gen_range(0.0..1.0)).collect(),
             output_node: (0..HIDDEN_LAYER_COUNT+1).map(|_|rng.gen_range(0.0..1.0)).collect()
         }
     }
@@ -111,39 +221,42 @@ impl Eval {
 
     fn forward_propagate(&self, input: &[f64]) -> (f64, Vec<f64>) 
     {
-        let hidden: Vec<f64> = self.hidden_layer.chunks_exact(FACTOR_COUNT+1).map(|a| {
+        let hidden: Vec<f64> = self.hidden_layer.chunks_exact(self.factor_count+1).map(|a| {
             Self::activate(input, a)
         }).collect();
+        
 
         let output = Self::activate(&hidden, &self.output_node);
 
         (output, hidden)
     }
 
-    fn back_propagate(&mut self, expected: f64, output: f64, hidden_outputs: &Vec<f64>, input: &Vec<f64>)
+    fn back_propagate(&mut self, expected: f64, output: f64, hidden_outputs: &Vec<f64>, input: &[f64], rate: f64) -> f64
     {
         let output_error = (output - expected) * output * (1.0-output);
-        let hidden_errors = self.output_node.iter()
+        let hidden_errors: Vec<_> = self.output_node.iter()
             .skip(1)
-            .zip(hidden_outputs).map(|(weight, output)| {
-                weight * output_error * output * (1.0-output)
-            });
+            .zip(hidden_outputs).map(|(weight, hidden_output)| {
+                weight * output_error * hidden_output * (1.0-hidden_output)
+            }).collect();
         
-        for (node, hidden_error) in self.hidden_layer.chunks_exact_mut(FACTOR_COUNT+1).zip(hidden_errors) {
-            Self::train_node(node, hidden_error, input);
+        for (node, &hidden_error) in self.hidden_layer.chunks_exact_mut(self.factor_count+1).zip(&hidden_errors) {
+            Self::train_node(node, hidden_error, input, rate);
         }
     
-        Self::train_node(&mut self.output_node, output_error, hidden_outputs);
+        Self::train_node(&mut self.output_node, output_error, hidden_outputs, rate);
+
+        hidden_errors.into_iter().map(|a| a.abs()).sum::<f64>() + output_error.abs()
     }
 
-    fn train_node(node: &mut [f64], error: f64, inputs: &Vec<f64>) 
+    fn train_node(node: &mut [f64], error: f64, inputs: &[f64], rate: f64) 
     {
         let mut node_iter = node.iter_mut();
-        *node_iter.next().unwrap() -= LEARNING_RATE * error; // Bias node
+        *node_iter.next().unwrap() -= rate * error; // Bias node
 
         for (weight, input) in node_iter.zip(inputs) 
         {
-            *weight -= LEARNING_RATE * error * input
+            *weight -= rate * error * input
         }
     }
 
@@ -162,61 +275,24 @@ impl Eval {
         let opp_adjacent_high_heights = adjacent_heights(state, opp_low_worker);
         let opp_adjacent_low_heights = adjacent_heights(state, opp_high_worker);
 
-        let my_high_mobility = my_adjacent_high_heights[0] + my_adjacent_high_heights[1] + my_adjacent_high_heights[2] + my_adjacent_high_heights[3] + my_adjacent_high_heights[4];
-        let my_low_mobility = my_adjacent_low_heights[0] + my_adjacent_low_heights[1] + my_adjacent_low_heights[2] + my_adjacent_low_heights[3] + my_adjacent_low_heights[4];
-        let opp_high_mobility = opp_adjacent_high_heights[0] + opp_adjacent_high_heights[1] + opp_adjacent_high_heights[2] + opp_adjacent_high_heights[3] + opp_adjacent_high_heights[4];
-        let opp_low_mobility = opp_adjacent_low_heights[0] + opp_adjacent_low_heights[1] + opp_adjacent_low_heights[2] + opp_adjacent_low_heights[3] + opp_adjacent_low_heights[4];
-
-        let factors:[usize; FACTOR_COUNT] = [
+        let mut factors = vec![
             distance_between(my_high_worker, my_low_worker),
             distance_between(opp_high_worker, opp_low_worker),
             distance_between(my_low_worker, opp_high_worker),
             distance_between(my_low_worker, opp_low_worker),
             distance_between(my_high_worker, opp_high_worker),
             distance_between(my_high_worker, opp_low_worker),
-            my_high_worker_height,
-            my_low_worker_height,
-            opp_high_worker_height,
-            opp_low_worker_height,
-            my_adjacent_high_heights[0],
-            my_adjacent_high_heights[1],
-            my_adjacent_high_heights[2],
-            my_adjacent_high_heights[3],
-            my_adjacent_high_heights[4],
-            my_adjacent_high_heights[5],
-            my_adjacent_high_heights[6],
-            my_adjacent_high_heights[7],
-            my_adjacent_low_heights[0],
-            my_adjacent_low_heights[1],
-            my_adjacent_low_heights[2],
-            my_adjacent_low_heights[3],
-            my_adjacent_low_heights[4],
-            my_adjacent_low_heights[5],
-            my_adjacent_low_heights[6],
-            my_adjacent_low_heights[7],
-            opp_adjacent_high_heights[0],
-            opp_adjacent_high_heights[1],
-            opp_adjacent_high_heights[2],
-            opp_adjacent_high_heights[3],
-            opp_adjacent_high_heights[4],
-            opp_adjacent_high_heights[5],
-            opp_adjacent_high_heights[6],
-            opp_adjacent_high_heights[7],
-            opp_adjacent_low_heights[0],
-            opp_adjacent_low_heights[1],
-            opp_adjacent_low_heights[2],
-            opp_adjacent_low_heights[3],
-            opp_adjacent_low_heights[4],
-            opp_adjacent_low_heights[5],
-            opp_adjacent_low_heights[6],
-            opp_adjacent_low_heights[7],
-            my_high_mobility,
-            my_low_mobility,
-            opp_high_mobility,
-            opp_low_mobility,
+            my_high_worker_height as f64 / 3.0,
+            my_low_worker_height as f64 / 3.0,
+            opp_high_worker_height as f64 / 3.0,
+            opp_low_worker_height as f64 / 3.0
         ];
+        factors.extend(my_adjacent_high_heights.map(|a| a as f64 / 8.0));
+        factors.extend(my_adjacent_low_heights.map(|a| a as f64 / 8.0));
+        factors.extend(opp_adjacent_high_heights.map(|a| a as f64 / 8.0));
+        factors.extend(opp_adjacent_low_heights.map(|a| a as f64 / 8.0));
 
-        factors.into_iter().map(|f| f as f64).collect()
+        factors
     }
 }
 
@@ -236,16 +312,17 @@ impl minimax::Evaluator for Eval {
     }
 }
 
-fn adjacent_heights(state: &GameState, square: usize) -> [usize; 8]
+fn adjacent_heights(state: &GameState, square: usize) -> [usize; 6]
 {
-    let mut heights = [0; 8]; // Height offsets: -3, -2, -1, 0, +1, +2, +3, Dome
-    let height = state.squares[square].height;
+    let mut heights = [0; 6];
     for &adjacency in ADJACENCIES[square] {
         let square = state.squares[adjacency];
         if square.dome {
-            heights[7] += 1;
+            heights[5] += 1;
+        } else if square.worker {
+            heights[4] += 1;
         } else {
-            heights[(square.height + 3 - height) as usize] += 1; // Add 3 to make subtraction never go negative
+            heights[(square.height) as usize] += 1
         }
     }
 
@@ -253,9 +330,9 @@ fn adjacent_heights(state: &GameState, square: usize) -> [usize; 8]
 }
 
 
-fn distance_between(square1: usize, square2: usize) -> usize {
+fn distance_between(square1: usize, square2: usize) -> f64 {
     if square1 == square2 {
-        0
+        0.0
     } else {
         let (y1, x1) = (square1 / 5, square1 % 5);
         let (y2, x2) = (square2 / 5, square2 % 5);
@@ -263,7 +340,7 @@ fn distance_between(square1: usize, square2: usize) -> usize {
         let xdiff = if x1 < x2 {x2 - x1} else {x1 - x2};
         let ydiff = if y1 < y2 {y2 - y1} else {y1 - y2};
 
-        xdiff.max(ydiff)
+        xdiff.max(ydiff) as f64 / 5.0
     }
 }
 
