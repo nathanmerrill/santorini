@@ -18,9 +18,80 @@ fn main()
     match args.get(1).map(|a| a.as_str()) {
         Some("Compare") => compare_history(),
         Some("Test") => test(),
+        Some("Play") => play().unwrap(),
         Some(a) => panic!("Unexpected argument! {}", a),
         None => create_history()
     }
+}
+
+fn play() -> Result<(), std::io::Error>{
+    println!("Welcome to Santorini!  Would you like to be player 1, 2, or Random?");
+    let mut input = String::new();
+    let player = loop {
+       std::io::stdin().read_line(&mut input)?;
+    
+        match input.as_str().trim() {
+            "1" => break Some(Player::P1),
+            "2" => break Some(Player::P2),
+            "R" | "Random" => break None,
+            _ => println!("Invalid response. Please enter in '1', '2', or 'R'")
+        }        
+    };
+
+    let player = player.unwrap_or_else(|| if rand::thread_rng().gen_bool(0.5) {Player::P1} else {Player::P2} );
+    let eval = History::read().latest;
+    let mut engine = ParallelSearch::new(eval.clone(), minimax::IterativeOptions::default(), minimax::ParallelOptions::new());  
+    engine.set_timeout(Duration::from_secs(1));
+
+    let mut game = GameState::default();
+
+    while !game.game_over {
+        println!("{}", game);
+        let _move = 
+        if game.current_player == player {
+            input.clear();
+            let mut available_moves = vec![];
+            Santorini::generate_moves(&game, &mut available_moves);
+            if available_moves.first() == Some(&OUT_OF_MOVES) {
+                println!("You have no available moves!");
+                OUT_OF_MOVES
+            } else {
+
+                if game.in_setup {
+                    println!("Please enter the locations of your starting workers (X1,Y2):");
+                } else {
+                    println!("Please enter your next move: (X1:Y2+Z3 or X1:Y2)");
+                }
+                    
+                *loop {
+                    std::io::stdin().read_line(&mut input)?;
+                    
+                    match available_moves.iter().find(|a| a.notate().as_str().eq(input.trim())) {
+                        Some(a) => break a,
+                        None => match game.in_setup {
+                            true => println!("Invalid input. Please enter the coordinates of where you would like your two workers, starting with the male. \nThe coordinates should be separated by a comma.\nExample: B3,A1 means to place the male worker on the 2nd column, 3rd row, and the female worker on the first column and the first row"),
+                            false => println!("Invalid input. Please enter the coordinates of where you would like to move then build. \nThe initial coordinate indicates which worker to move, the next coordinate indicates where to move to, and the last coordinate indicates where to build. \nFor example, B2:C2+C3 means to move the worker on B2 to C2, then build on C3")
+                        }
+                    }
+                }
+            }          
+            
+        } else {
+            let _move = engine.choose_move(&game).expect("No moves returned!");
+            println!("I choose: {}", _move.notate());
+            _move
+        };
+
+        game = Santorini::apply(&mut game, _move).expect("State was not applied!");   
+    }
+
+    if game.winner == player {
+        println!("You won!")
+    } else {
+        println!("I won!")
+    }
+
+    Ok(())
 }
 
 fn test() {
@@ -344,7 +415,7 @@ fn distance_between(square1: usize, square2: usize) -> f64 {
     }
 }
 
-use std::{fmt::Display, fs::OpenOptions, io::Write};
+use std::{fmt::Display, fs::OpenOptions, io::Write, time::Duration};
 
 pub enum God {
     None,
@@ -423,7 +494,7 @@ impl minimax::Game for Santorini
     type S = GameState;
 
     fn notation(_state: &Self::S, _move: Self::M) -> Option<String> {
-        Some("".to_string())
+        Some(_move.notate())
     }
 
     fn generate_moves(state: &Self::S, moves: &mut Vec<Self::M>) 
@@ -550,6 +621,48 @@ pub struct GameMove {
     build: u8,
 }
 
+impl GameMove {
+    fn notate(&self) -> String {
+        match (self.origin, self.step, self.build) {
+            (u8::MAX, u8::MAX, u8::MAX) => "S".to_owned(),
+            (u8::MAX, a, b) => GameMove::to_coord(a).to_owned() + "," + GameMove::to_coord(b),
+            (a, b, u8::MAX) => GameMove::to_coord(a).to_owned() + ":" + GameMove::to_coord(b),
+            (a, b, c) => GameMove::to_coord(a).to_owned() + ":" + GameMove::to_coord(b) + "+"+GameMove::to_coord(c),        
+        }
+    }
+
+    fn to_coord(index: u8) -> &'static str {
+        match index {
+            0 => "A1",
+            1 => "B1",
+            2 => "C1",
+            3 => "D1",
+            4 => "E1",
+            5 => "A2",
+            6 => "B2",
+            7 => "C2",
+            8 => "D2",
+            9 => "E2",
+            10 => "A3",
+            11 => "B3",
+            12 => "C3",
+            13 => "D3",
+            14 => "E3",
+            15 => "A4",
+            16 => "B4",
+            17 => "C4",
+            18 => "D4",
+            19 => "E4",
+            20 => "A5",
+            21 => "B5",
+            22 => "C5",
+            23 => "D5",
+            24 => "E5",
+            _ => panic!("Unexpected coordinate!")
+        }
+    }
+}
+
 impl Default for GameState {
     fn default() -> Self {
         Self {
@@ -623,6 +736,11 @@ impl GameState {
             for &destination in ADJACENCIES[position] {
                 let new_square = self.squares[destination];
                 let destination_u8 = destination as u8;
+                if self.squares[position].height == 2 && self.squares[destination].height == 3 {
+                    moves.push(GameMove { origin: position_u8, step: destination_u8, build: u8::MAX });
+                    continue;
+                }
+
                 if !new_square.dome && !new_square.worker && new_square.height <= self.squares[position].height + 1 {
                     moves.push(GameMove {origin: position_u8, step: destination_u8, build: position_u8});
                     for &build in ADJACENCIES[destination] {
@@ -640,9 +758,9 @@ impl GameState {
     fn place_workers(self, options: &mut Vec<GameMove>)
     {
         for i in 0..25 {
-            for j in i+1 .. 25 {
-                if !self.squares[i].worker && !self.squares[j].worker {
-                    options.push(GameMove { origin: 0, step: i as u8, build: j as u8 });
+            for j in 0 .. 25 {
+                if !self.squares[i].worker && !self.squares[j].worker && i != j {
+                    options.push(GameMove { origin: u8::MAX, step: i as u8, build: j as u8 });
                 }
             }
         }
